@@ -22,8 +22,8 @@ rpm:	src
 	cd ../SPECS ; rpmbuild -ba asmballoon.spec
 
 install:
-	install -d 0755 $(bindir)
-	install -m 0755 bin/asmballoon
+	install -m 0755 -d $(bindir)
+	install -m 0755 bin/asmballoon $(bindir)
 
 clean:
 	rm $(HOME)/SOURCES/asmballoon-$(version).tbz2

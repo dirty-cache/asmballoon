@@ -90,6 +90,7 @@ inflate() {
 	prompt inflating diskgroup $DG
 	DECLARE
 	PREFIX   VARCHAR2(10) := 'BALLOON_';
+	SEED     VARCHAR2(20) := '';
 	HWM      NUMBER       := $MAXPERC;
 	TOTAL_MB NUMBER       := 0;
 	FREE_MB NUMBER        := 0;
@@ -102,6 +103,7 @@ inflate() {
 	SQ:='ALTER DISKGROUP $DG ADD DIRECTORY ' || chr(39) || '+${DG}/BALLOON' || chr(39) || chr(10);
 	DBMS_OUTPUT.PUT_LINE(SQ);
 	EXECUTE IMMEDIATE (SQ);
+	SEED := PREFIX || LPAD(0,DIGITS,0);
 	DBMS_OUTPUT.PUT_LINE('COPY SEED BALLOON FILE');
 	FOR i in 0..9999
 	LOOP
@@ -109,13 +111,13 @@ inflate() {
 	  SELECT FREE_MB, TOTAL_MB INTO FREE_MB, TOTAL_MB from v\$asm_diskgroup where name='$DG';
 	  IF FREE_MB < $MINFREE THEN EXIT;  END IF;
 	  IF 100 * FREE_MB / TOTAL_MB < (100-HWM) THEN EXIT;  END IF;
-	  IF i = 0 THEN DBMS_FILE_TRANSFER.COPY_FILE('balloonsrc','balloon','balloondir',BALLOON);
-	  ELSE          DBMS_FILE_TRANSFER.COPY_FILE('balloondir',PREFIX||LPAD(0,DIGITS,0),'balloondir',BALLOON);
-	  END IF;
 	  DBMS_OUTPUT.PUT_LINE('CREATE FILE ' || BALLOON);
+	  IF i = 0 THEN DBMS_FILE_TRANSFER.COPY_FILE('balloonsrc','balloon','balloondir',SEED);
+	  ELSE          DBMS_FILE_TRANSFER.COPY_FILE('balloondir',SEED,'balloondir', BALLOON);
+	  END IF;
 	END LOOP;
-	EXECUTE IMMEDIATE ('drop directory balloon');
-	EXECUTE IMMEDIATE ('drop directory balltmp');
+	EXECUTE IMMEDIATE ('drop directory balloondir');
+	EXECUTE IMMEDIATE ('drop directory balloonsrc');
 	END;
 	/
 	EOF
