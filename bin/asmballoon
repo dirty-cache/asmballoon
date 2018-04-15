@@ -1,0 +1,188 @@
+#!/bin/bash
+#============================================================================
+# Title       : asmballoon
+# Description : Reclaims ASM diskgroup space by creating balloon files
+# Author      : Bart Sjerps <bart@outrun.nl>
+# License     : GPLv3+
+# ---------------------------------------------------------------------------
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License at <http://www.gnu.org/licenses/> for
+# more details.
+# ---------------------------------------------------------------------------
+# Revision history:
+# 2018-04-12 : Created
+# ---------------------------------------------------------------------------
+# Additional info:
+# asmballoon is in development phase. Use at own risk!
+#============================================================================
+# Configuration parameters:
+# ---------------------------------------------------------------------------
+
+wd=/u01/tmp
+MAXPERC=90      # high water mark
+MINFREE=2048    # minimum space to keep free in MiB
+BALSIZE=1024    # Balloon file size in MiB
+SERVEROUTPUT=on # Verbose SQL output
+
+#============================================================================
+# Initialization - Logging - Etc.
+# ---------------------------------------------------------------------------
+
+#============================================================================
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<- EOF
+	
+	$(basename $0) [-c] [-k] [-q] [-s size] [-m minfree] [-p maxperc] <DG>
+	
+	  -c            - cleanup old balloon files
+	  -k            - keep balloon files (don't auto cleanup)
+	  -s <size>     - size of the source balloon file in MiB (default 1024)
+	  -m <minfree>  - minimum free MiB to keep available in the DG (default 2048)
+	  -p <maxperc>  - stop if DG is this percentage full (default 90)
+	  -q (quiet)    - Disable most SQL output
+	
+	$(basename $0) works by creating a large balloon file containing only zero blocks,
+	except the header which is the contents of a dummy SPFILE. This triggers Oracle ASM
+	in allowing such a file to be stored in ASM. 
+	$(basename $0) fills up the disk group until either the minimum free MB is reached or
+	the maximum percentage full is reached. Then the files are deleted again.
+	The net effect is that unused space that contains leftover data from actions such as ASM
+	rebalance, dropping datafiles etc. can be cleared such that thin provisioned storage arrays
+	can reclaim the unallocated capacity.
+	
+	Issues:
+	- During the creation of balloon files in the diskgroup, Oracle also creates aliases in
+	  <DGNAME>/PARAMETERFILE/spfile.<id> because it thinks we are storing real SP files. This is harmless
+	  and the files are deleted together with the primary balloon files
+	- 
+	
+	EOF
+}
+
+#============================================================================
+# Functions
+# ---------------------------------------------------------------------------
+
+makeballoon() {
+  echo "*.compatible='11.1.0.2.0'" > $wd/pfile
+  sqlplus -s / as sysdba <<< "create spfile='$wd/spfile' from pfile='$wd/pfile';"
+  dd if=/dev/zero bs=1M count=${BALSIZE} of=$wd/balloon status=none
+  dd if=$wd/spfile bs=512 of=$wd/balloon conv=notrunc status=none
+  rm $wd/{pfile,spfile}
+  echo "seed file created."
+}
+
+inflate() {
+  makeballoon
+  test -z "$KEEP" && trap 'deflate' EXIT INT TERM HUP
+  sqlplus -s / as sysdba <<- EOF
+	SET serveroutput $SERVEROUTPUT
+	WHENEVER SQLERROR EXIT 2;
+	prompt inflating diskgroup $DG
+	DECLARE
+	PREFIX   VARCHAR2(10) := 'BALLOON_';
+	HWM      NUMBER       := $MAXPERC;
+	TOTAL_MB NUMBER       := 0;
+	FREE_MB NUMBER        := 0;
+	DIGITS NUMBER         := 4;
+	SQ clob               := '';
+	BALLOON VARCHAR2(20)  := '';
+	BEGIN
+	EXECUTE IMMEDIATE ('create or replace directory balloondir as ' || chr(39) || '+${DG}/BALLOON' || chr(39));
+	EXECUTE IMMEDIATE ('create or replace directory balloonsrc as ' || chr(39) || '$wd' || chr(39));
+	SQ:='ALTER DISKGROUP $DG ADD DIRECTORY ' || chr(39) || '+${DG}/BALLOON' || chr(39) || chr(10);
+	DBMS_OUTPUT.PUT_LINE(SQ);
+	EXECUTE IMMEDIATE (SQ);
+	DBMS_OUTPUT.PUT_LINE('COPY SEED BALLOON FILE');
+	FOR i in 0..9999
+	LOOP
+	  BALLOON := PREFIX || LPAD(i,DIGITS,0);
+	  SELECT FREE_MB, TOTAL_MB INTO FREE_MB, TOTAL_MB from v\$asm_diskgroup where name='$DG';
+	  IF FREE_MB < $MINFREE THEN EXIT;  END IF;
+	  IF 100 * FREE_MB / TOTAL_MB < (100-HWM) THEN EXIT;  END IF;
+	  IF i = 0 THEN DBMS_FILE_TRANSFER.COPY_FILE('balloonsrc','balloon','balloondir',BALLOON);
+	  ELSE          DBMS_FILE_TRANSFER.COPY_FILE('balloondir',PREFIX||LPAD(0,DIGITS,0),'balloondir',BALLOON);
+	  END IF;
+	  DBMS_OUTPUT.PUT_LINE('CREATE FILE ' || BALLOON);
+	END LOOP;
+	EXECUTE IMMEDIATE ('drop directory balloon');
+	EXECUTE IMMEDIATE ('drop directory balltmp');
+	END;
+	/
+	EOF
+  rm $wd/balloon
+}
+
+deflate() {
+  sqlplus -s / as sysdba <<- EOF
+	set serveroutput $SERVEROUTPUT
+	prompt deflating diskgroup $DG
+	DECLARE
+	SQ clob := '';
+	STR VARCHAR2(80) := '';
+	CURSOR cur IS select concat('+'||gname, sys_connect_by_path(aname, '/')) Filename
+	  from ( select b.name gname, a.parent_index pindex, a.name aname,
+	                    a.reference_index rindex , a.system_created, a.alias_directory,
+	                    c.type file_type, c.bytes bytes
+	             from v\$asm_alias a, v\$asm_diskgroup b, v\$asm_file c
+	             where a.group_number = b.group_number
+	                   and a.group_number     = c.group_number(+)
+	                   and a.file_number      = c.file_number(+)
+	                   and a.file_incarnation = c.incarnation(+)
+	  )
+	  where bytes is not NULL
+	  and aname like 'BALLOON%'
+	  start with (mod(pindex, power(2, 24))) = 0
+	  and rindex in
+	  ( select a.reference_index
+	    from v\$asm_alias a, v\$asm_diskgroup b
+	    where a.group_number = b.group_number
+	    and b.name = '${DG}'
+	    and a.name = 'BALLOON'
+	  )
+	  connect by prior rindex = pindex;
+	BEGIN
+	OPEN cur;
+	LOOP
+	  FETCH cur into STR;
+	    EXIT WHEN cur%NOTFOUND;
+	    SQ:='ALTER DISKGROUP ${DG} DROP FILE ' || chr(39) || STR || chr(39) || chr(10);
+	    DBMS_OUTPUT.PUT_LINE(SQ);
+	    EXECUTE IMMEDIATE (SQ);
+	  END LOOP;
+	CLOSE cur;
+	SQ:='ALTER DISKGROUP ${DG} DROP DIRECTORY ' || chr(39) || '+${DG}/BALLOON' || chr(39) || chr(10);
+	DBMS_OUTPUT.PUT_LINE(SQ);
+	EXECUTE IMMEDIATE (SQ);
+	END;
+	/
+	EOF
+}
+
+while getopts ":hckp:m:s:q" OPT; do
+  case "$OPT" in
+     c) ACTION=deflate ;;
+     k) KEEP=Y ;;
+     p) MAXPERC=$OPTARG ;;
+     m) MINFREE=$OPTARG ;;
+     s) BALSIZE=$OPTARG ;;
+     q) SERVEROUTPUT=off ;;
+  \?|h) usage ; exit 0 ;;
+  esac
+done ; shift $(expr $OPTIND - 1)
+
+DG=$1; shift
+
+case $ACTION in
+  deflate) deflate ;;
+  *)       inflate ;;
+esac
