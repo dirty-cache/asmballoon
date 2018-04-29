@@ -5,8 +5,8 @@
 # License     : GPLv3+
 # ---------------------------------------------------------------------------
 
-version    = 0.0.1
-prefix     = /usr/local
+version    = 0.1
+prefix     = $$HOME
 bindir     = $(prefix)/bin
 mandir     = $(prefix)/share/man
 docdir     = $(prefix)/share/doc
@@ -15,18 +15,12 @@ sysconfdir = /etc
 
 all:
 
-src:
-	tar -jcvf $(HOME)/SOURCES/asmballoon-$(version).tbz2 --transform "s|^|asmballoon/|" *
-
-rpm:	src
-	cd ../SPECS ; rpmbuild -ba asmballoon.spec
-
 install:
 	install -m 0755 -d $(bindir)
 	install -m 0755 bin/asmballoon $(bindir)
 
-clean:
-	rm $(HOME)/SOURCES/asmballoon-$(version).tbz2
+uninstall:
+	rm $(prefix)/bin/asmballoon
 
 .PHONY: install
 

@@ -25,7 +25,7 @@
 # Configuration parameters:
 # ---------------------------------------------------------------------------
 
-wd=/u01/tmp
+wd=/tmp
 MAXPERC=90      # high water mark
 MINFREE=2048    # minimum space to keep free in MiB
 BALSIZE=1024    # Balloon file size in MiB
@@ -74,11 +74,11 @@ usage() {
 
 makeballoon() {
   echo "*.compatible='11.1.0.2.0'" > $wd/pfile
-  sqlplus -s / as sysdba <<< "create spfile='$wd/spfile' from pfile='$wd/pfile';"
-  dd if=/dev/zero bs=1M count=${BALSIZE} of=$wd/balloon status=none
+  sqlplus -s / as sysdba <<< "create spfile='$wd/spfile' from pfile='$wd/pfile';" &>/dev/null
+  dd if=/dev/zero bs=1 of=$wd/balloon status=none count=0 seek=${BALSIZE}M
   dd if=$wd/spfile bs=512 of=$wd/balloon conv=notrunc status=none
   rm $wd/{pfile,spfile}
-  echo "seed file created."
+  # echo "seed file created."
 }
 
 inflate() {
@@ -101,10 +101,7 @@ inflate() {
 	EXECUTE IMMEDIATE ('create or replace directory balloondir as ' || chr(39) || '+${DG}/BALLOON' || chr(39));
 	EXECUTE IMMEDIATE ('create or replace directory balloonsrc as ' || chr(39) || '$wd' || chr(39));
 	SQ:='ALTER DISKGROUP $DG ADD DIRECTORY ' || chr(39) || '+${DG}/BALLOON' || chr(39) || chr(10);
-	DBMS_OUTPUT.PUT_LINE(SQ);
 	EXECUTE IMMEDIATE (SQ);
-	SEED := PREFIX || LPAD(0,DIGITS,0);
-	DBMS_OUTPUT.PUT_LINE('COPY SEED BALLOON FILE');
 	FOR i in 0..9999
 	LOOP
 	  BALLOON := PREFIX || LPAD(i,DIGITS,0);
@@ -112,9 +109,7 @@ inflate() {
 	  IF FREE_MB < $MINFREE THEN EXIT;  END IF;
 	  IF 100 * FREE_MB / TOTAL_MB < (100-HWM) THEN EXIT;  END IF;
 	  DBMS_OUTPUT.PUT_LINE('CREATE FILE ' || BALLOON);
-	  IF i = 0 THEN DBMS_FILE_TRANSFER.COPY_FILE('balloonsrc','balloon','balloondir',SEED);
-	  ELSE          DBMS_FILE_TRANSFER.COPY_FILE('balloondir',SEED,'balloondir', BALLOON);
-	  END IF;
+	  DBMS_FILE_TRANSFER.COPY_FILE('balloonsrc','balloon','balloondir',BALLOON);
 	END LOOP;
 	EXECUTE IMMEDIATE ('drop directory balloondir');
 	EXECUTE IMMEDIATE ('drop directory balloonsrc');
@@ -157,13 +152,14 @@ deflate() {
 	LOOP
 	  FETCH cur into STR;
 	    EXIT WHEN cur%NOTFOUND;
+	    DBMS_OUTPUT.PUT_LINE('DELETE FILE ' || STR);
 	    SQ:='ALTER DISKGROUP ${DG} DROP FILE ' || chr(39) || STR || chr(39) || chr(10);
-	    DBMS_OUTPUT.PUT_LINE(SQ);
+	    -- DBMS_OUTPUT.PUT_LINE(SQ);
 	    EXECUTE IMMEDIATE (SQ);
 	  END LOOP;
 	CLOSE cur;
 	SQ:='ALTER DISKGROUP ${DG} DROP DIRECTORY ' || chr(39) || '+${DG}/BALLOON' || chr(39) || chr(10);
-	DBMS_OUTPUT.PUT_LINE(SQ);
+	-- DBMS_OUTPUT.PUT_LINE(SQ);
 	EXECUTE IMMEDIATE (SQ);
 	END;
 	/
@@ -183,6 +179,8 @@ while getopts ":hckp:m:s:q" OPT; do
 done ; shift $(expr $OPTIND - 1)
 
 DG=$1; shift
+
+test -z "$DG" && usage && exit 0
 
 case $ACTION in
   deflate) deflate ;;
