@@ -27,8 +27,7 @@
 
 wd=/tmp
 MAXPERC=90      # high water mark
-MINFREE=2048    # minimum space to keep free in MiB
-BALSIZE=1024    # Balloon file size in MiB
+MINFREE=256     # minimum space to keep free in MiB
 SERVEROUTPUT=on # Verbose SQL output
 
 #============================================================================
@@ -73,16 +72,27 @@ usage() {
 # ---------------------------------------------------------------------------
 
 makeballoon() {
+  local balsize=$1; shift
   echo "*.compatible='11.1.0.2.0'" > $wd/pfile
   sqlplus -s / as sysdba <<< "create spfile='$wd/spfile' from pfile='$wd/pfile';" &>/dev/null
-  dd if=/dev/zero bs=1 of=$wd/balloon status=none count=0 seek=${BALSIZE}M
+  dd if=/dev/zero bs=1 of=$wd/balloon status=none count=0 seek=${balsize}M
   dd if=$wd/spfile bs=512 of=$wd/balloon conv=notrunc status=none
   rm $wd/{pfile,spfile}
-  # echo "seed file created."
+}
+
+dgsize() {
+  local return=$(sqlplus -S / as sysdba <<- EOF
+	SET SERVEROUTPUT ON FEEDBACK OFF HEADING OFF
+	select total_mb from v\$asm_diskgroup where name = upper('$1');
+	exit;
+	EOF
+	)
+  echo $return
 }
 
 inflate() {
-  makeballoon
+  local size=$(dgsize $DG)
+  makeballoon $((size/100))
   test -z "$KEEP" && trap 'deflate' EXIT INT TERM HUP
   sqlplus -s / as sysdba <<- EOF
 	SET serveroutput $SERVEROUTPUT
@@ -178,7 +188,7 @@ while getopts ":hckp:m:s:q" OPT; do
   esac
 done ; shift $(expr $OPTIND - 1)
 
-DG=$1; shift
+DG=${1^^}; shift
 
 test -z "$DG" && usage && exit 0
 
