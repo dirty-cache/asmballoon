@@ -4,7 +4,7 @@ ASMBalloon - Reclaim space on Oracle ASM diskgroups
 ## Description
 
 ASMballoon writes files with zeroes into an ASM diskgroup until reaching a certain watermark,
-then deletes all created files again. The result is many unused ASM allocation units are 
+then deletes all created files again. The result is that many unused ASM allocation units are 
 zeroed out so that smart storage systems can reclaim the unused capacity.
 
 ## WARNING

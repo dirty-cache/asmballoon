@@ -1,198 +1,216 @@
-#!/bin/bash
-#============================================================================
-# Title       : asmballoon
-# Description : Reclaims ASM diskgroup space by creating balloon files
-# Author      : Bart Sjerps <bart@outrun.nl>
-# License     : GPLv3+
-# ---------------------------------------------------------------------------
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License at <http://www.gnu.org/licenses/> for
-# more details.
-# ---------------------------------------------------------------------------
-# Revision history:
-# 2018-04-12 : Created
-# ---------------------------------------------------------------------------
-# Additional info:
-# asmballoon is in development phase. Use at own risk!
-#============================================================================
-# Configuration parameters:
-# ---------------------------------------------------------------------------
+#!/usr/bin/env python3
 
-wd=/tmp
-MAXPERC=90      # high water mark
-MINFREE=256     # minimum space to keep free in MiB
-SERVEROUTPUT=on # Verbose SQL output
+"""
+asmballoon - Reclaims ASM diskgroup space by creating balloon files
+Copyright (c) 2024 - Bart Sjerps <bart@dirty-cache.com>
+License: GPLv3+
+"""
 
-#============================================================================
-# Initialization - Logging - Etc.
-# ---------------------------------------------------------------------------
+import os, logging, argparse, tempfile, logging
+from subprocess import Popen, PIPE
 
-#============================================================================
-# Usage
-# ---------------------------------------------------------------------------
-usage() {
-  cat <<- EOF
-	
-	$(basename $0) [-c] [-k] [-q] [-s size] [-m minfree] [-p maxperc] <DG>
-	
-	  -c            - cleanup old balloon files
-	  -k            - keep balloon files (don't auto cleanup)
-	  -s <size>     - size of the source balloon file in MiB (default 1024)
-	  -m <minfree>  - minimum free MiB to keep available in the DG (default 2048)
-	  -p <maxperc>  - stop if DG is this percentage full (default 90)
-	  -q (quiet)    - Disable most SQL output
-	
-	$(basename $0) works by creating a large balloon file containing only zero blocks,
-	except the header which is the contents of a dummy SPFILE. This triggers Oracle ASM
-	in allowing such a file to be stored in ASM. 
-	$(basename $0) fills up the disk group until either the minimum free MB is reached or
-	the maximum percentage full is reached. Then the files are deleted again.
-	The net effect is that unused space that contains leftover data from actions such as ASM
-	rebalance, dropping datafiles etc. can be cleared such that thin provisioned storage arrays
-	can reclaim the unallocated capacity.
-	
-	Issues:
-	- During the creation of balloon files in the diskgroup, Oracle also creates aliases in
-	  <DGNAME>/PARAMETERFILE/spfile.<id> because it thinks we are storing real SP files. This is harmless
-	  and the files are deleted together with the primary balloon files
-	- 
-	
-	EOF
-}
+logging.basicConfig(level=logging.DEBUG,
+    format="%(asctime)s %(levelname)-8s: %(message)s",
+    datefmt='%Y-%m-%d %I:%M:%S')
 
-#============================================================================
-# Functions
-# ---------------------------------------------------------------------------
+tmpdir  = tempfile.TemporaryDirectory(prefix="asmb_")
+tempdir = tmpdir.name
 
-makeballoon() {
-  local balsize=$1; shift
-  echo "*.compatible='11.1.0.2.0'" > $wd/pfile
-  sqlplus -s / as sysdba <<< "create spfile='$wd/spfile' from pfile='$wd/pfile';" &>/dev/null
-  dd if=/dev/zero bs=1 of=$wd/balloon status=none count=0 seek=${balsize}M
-  dd if=$wd/spfile bs=512 of=$wd/balloon conv=notrunc status=none
-  rm $wd/{pfile,spfile}
-}
+sql_header = """\
+SET tab off feedback off verify off heading off lines 1000 pages 0 trims on serveroutput on
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+"""
 
-dgsize() {
-  local return=$(sqlplus -S / as sysdba <<- EOF
-	SET SERVEROUTPUT ON FEEDBACK OFF HEADING OFF
-	select total_mb from v\$asm_diskgroup where name = upper('$1');
-	exit;
-	EOF
-	)
-  echo $return
-}
+sql_progress = """\
+SELECT round(100*sofar/totalwork) percent, time_remaining remaining
+FROM   v$session_longops
+WHERE  message LIKE '%BALLOON%'
+AND    sofar/totalwork < 1;
+"""
 
-inflate() {
-  local size=$(dgsize $DG)
-  makeballoon $((size/100))
-  test -z "$KEEP" && trap 'deflate' EXIT INT TERM HUP
-  sqlplus -s / as sysdba <<- EOF
-	SET serveroutput $SERVEROUTPUT
-	WHENEVER SQLERROR EXIT 2;
-	prompt inflating diskgroup $DG
-	DECLARE
-	PREFIX   VARCHAR2(10) := 'BALLOON_';
-	SEED     VARCHAR2(20) := '';
-	HWM      NUMBER       := $MAXPERC;
-	TOTAL_MB NUMBER       := 0;
-	FREE_MB NUMBER        := 0;
-	DIGITS NUMBER         := 4;
-	SQ clob               := '';
-	BALLOON VARCHAR2(20)  := '';
-	BEGIN
-	EXECUTE IMMEDIATE ('create or replace directory balloondir as ' || chr(39) || '+${DG}/BALLOON' || chr(39));
-	EXECUTE IMMEDIATE ('create or replace directory balloonsrc as ' || chr(39) || '$wd' || chr(39));
-	SQ:='ALTER DISKGROUP $DG ADD DIRECTORY ' || chr(39) || '+${DG}/BALLOON' || chr(39) || chr(10);
-	EXECUTE IMMEDIATE (SQ);
-	FOR i in 0..9999
-	LOOP
-	  BALLOON := PREFIX || LPAD(i,DIGITS,0);
-	  SELECT FREE_MB, TOTAL_MB INTO FREE_MB, TOTAL_MB from v\$asm_diskgroup where name='$DG';
-	  IF FREE_MB < $MINFREE THEN EXIT;  END IF;
-	  IF 100 * FREE_MB / TOTAL_MB < (100-HWM) THEN EXIT;  END IF;
-	  DBMS_OUTPUT.PUT_LINE('CREATE FILE ' || BALLOON);
-	  DBMS_FILE_TRANSFER.COPY_FILE('balloonsrc','balloon','balloondir',BALLOON);
-	END LOOP;
-	EXECUTE IMMEDIATE ('drop directory balloondir');
-	EXECUTE IMMEDIATE ('drop directory balloonsrc');
-	END;
-	/
-	EOF
-  rm $wd/balloon
-}
+sql_inflate = """\
+CREATE OR REPLACE DIRECTORY balloonsrc AS '{tempdir}';
+CREATE OR REPLACE DIRECTORY balloondir as '+{dg}/balloon';
+ALTER DISKGROUP {dg} ADD DIRECTORY '+{dg}/BALLOON';
+EXEC DBMS_FILE_TRANSFER.COPY_FILE('balloonsrc','balloon','balloondir','BALLOON');
+DROP DIRECTORY balloondir;
+DROP DIRECTORY balloonsrc;
+"""
 
-deflate() {
-  sqlplus -s / as sysdba <<- EOF
-	set serveroutput $SERVEROUTPUT
-	prompt deflating diskgroup $DG
-	DECLARE
-	SQ clob := '';
-	STR VARCHAR2(80) := '';
-	CURSOR cur IS select concat('+'||gname, sys_connect_by_path(aname, '/')) Filename
-	  from ( select b.name gname, a.parent_index pindex, a.name aname,
-	                    a.reference_index rindex , a.system_created, a.alias_directory,
-	                    c.type file_type, c.bytes bytes
-	             from v\$asm_alias a, v\$asm_diskgroup b, v\$asm_file c
-	             where a.group_number = b.group_number
-	                   and a.group_number     = c.group_number(+)
-	                   and a.file_number      = c.file_number(+)
-	                   and a.file_incarnation = c.incarnation(+)
-	  )
-	  where bytes is not NULL
-	  and aname like 'BALLOON%'
-	  start with (mod(pindex, power(2, 24))) = 0
-	  and rindex in
-	  ( select a.reference_index
-	    from v\$asm_alias a, v\$asm_diskgroup b
-	    where a.group_number = b.group_number
-	    and b.name = '${DG}'
-	    and a.name = 'BALLOON'
-	  )
-	  connect by prior rindex = pindex;
-	BEGIN
-	OPEN cur;
-	LOOP
-	  FETCH cur into STR;
-	    EXIT WHEN cur%NOTFOUND;
-	    DBMS_OUTPUT.PUT_LINE('DELETE FILE ' || STR);
-	    SQ:='ALTER DISKGROUP ${DG} DROP FILE ' || chr(39) || STR || chr(39) || chr(10);
-	    -- DBMS_OUTPUT.PUT_LINE(SQ);
-	    EXECUTE IMMEDIATE (SQ);
-	  END LOOP;
-	CLOSE cur;
-	SQ:='ALTER DISKGROUP ${DG} DROP DIRECTORY ' || chr(39) || '+${DG}/BALLOON' || chr(39) || chr(10);
-	-- DBMS_OUTPUT.PUT_LINE(SQ);
-	EXECUTE IMMEDIATE (SQ);
-	END;
-	/
-	EOF
-}
+sql_dropfile = "ALTER DISKGROUP {dg} DROP FILE '+{dg}/BALLOON/BALLOON';"
+sql_dropdir  = "ALTER DISKGROUP {dg} DROP DIRECTORY '+{dg}/BALLOON';"
 
-while getopts ":hckp:m:s:q" OPT; do
-  case "$OPT" in
-     c) ACTION=deflate ;;
-     k) KEEP=Y ;;
-     p) MAXPERC=$OPTARG ;;
-     m) MINFREE=$OPTARG ;;
-     s) BALSIZE=$OPTARG ;;
-     q) SERVEROUTPUT=off ;;
-  \?|h) usage ; exit 0 ;;
-  esac
-done ; shift $(expr $OPTIND - 1)
+def exception_handler(func):
+    def inner(*args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        except ValueError:
+            pass
+    return inner
 
-DG=${1^^}; shift
+class Balloon():
+    def __init__(self, diskgroup):
+        self.diskgroup = diskgroup.upper()
+        try:
+            self.orahome   = os.environ['ORACLE_HOME']
+            self.sid       = os.environ['ORACLE_SID']
+        except KeyError:
+            raise ValueError("Environment not set")
 
-test -z "$DG" && usage && exit 0
+        proc = Popen(['/usr/bin/pgrep', '-x', 'ora_pmon_' + self.sid], env={}, stdout=PIPE)
+        proc.communicate()
+        if not proc.returncode == 0:
+            raise ValueError(f"Instance {self.sid} not running")
 
-case $ACTION in
-  deflate) deflate ;;
-  *)       inflate ;;
-esac
+    def sqlplus(self):
+        env      = dict(ORACLE_HOME=self.orahome, ORACLE_SID=self.sid)
+        sqlplus  = os.path.join(self.orahome, 'bin/sqlplus')
+        cmd      = [sqlplus, '-L','-S','/','as','sysdba']
+        proc     = Popen(cmd, env=env, stdin=PIPE, stdout=PIPE, stderr=PIPE, encoding='utf-8')
+        out, _   = proc.communicate(sql_header + sql)
+        if proc.returncode:
+            logging.error(out)
+            raise ValueError(f'SQLPLUS failed, rc={proc.returncode}')
+        else:
+            return out
+
+    @exception_handler
+    def dropfile(self):
+        sysdba(sql_dropfile.format(dg=self.diskgroup))
+
+    @exception_handler
+    def dropdir(self):
+        sysdba(sql_dropdir.format(dg=self.diskgroup))
+
+    def inflate(self):
+        logging.info(f"Inflating {self.diskgroup}")
+        sysdba(sql_inflate.format(dg=self.diskgroup, tempdir=tempdir))
+
+    def deflate(self):
+        logging.info(f"Deflating {self.diskgroup}")
+        self.dropfile()
+        self.dropdir()
+
+    @staticmethod
+    def mkballoon(size_mb):
+        logging.info(f"Creating {size_mb} MiB balloon file")
+        pfile  = os.path.join(tempdir, 'init.ora')
+        spfile = os.path.join(tempdir, 'balloon')
+        with open(pfile, 'w') as f:
+            f.write("*.compatible='11.1.0.2.0'\n")
+
+        sysdba(f"CREATE SPFILE='{spfile}' from pfile='{pfile}';")
+        os.truncate(spfile, size_mb * 2**20)
+
+    def dgstats(self):
+        result = sysdba(f"SELECT free_mb, total_mb FROM v$asm_diskgroup WHERE name = '{self.diskgroup}';")
+        f, t = result.split()
+        return int(f), int(t)
+
+    def disks(self):
+        r = sysdba(f"SELECT path FROM v$asm_disk JOIN v$asm_diskgroup dg USING (group_number) WHERE dg.name = '{self.diskgroup}';")
+        disks = r.splitlines()
+        for disk in disks:
+            d = os.path.realpath(disk)
+            s = os.stat(d)
+            print(os.major(s.st_rdev))
+            print(os.minor(s.st_rdev))
+            print(s)
+
+def progress(args):
+    r = sysdba(sql_progress)
+    print(r)
+
+def running(sid):
+    proc = Popen(['/usr/bin/pgrep', '-x', 'ora_pmon_'+sid], env={}, stdout=PIPE)
+    proc.communicate()
+    if proc.returncode == 0:
+        return True
+    return False
+
+def sysdba(sql):
+    orahome  = os.environ['ORACLE_HOME']
+    sid      = os.environ['ORACLE_SID']
+    if not running(sid):
+        raise ValueError("Not running")
+    env      = dict(ORACLE_HOME=orahome, ORACLE_SID=sid)
+    sqlplus  = os.path.join(orahome, 'bin/sqlplus')
+    cmd      = [sqlplus, '-L','-S','/','as','sysdba']
+    proc     = Popen(cmd, env=env, stdin=PIPE, stdout=PIPE, stderr=PIPE, encoding='utf-8')
+    out, err = proc.communicate(sql_header + sql)
+    if proc.returncode:
+        logging.error(out)
+        raise ValueError(f'SQLPLUS failed, rc={proc.returncode}')
+    else:
+        return out.strip()
+
+def reclaim(args):
+    balloon = Balloon(args.diskgroup)
+
+    free_mb, total_mb = balloon.dgstats()
+    logging.info(f'Size: {total_mb} MiB')
+    logging.info(f'Free: {free_mb} MiB')
+
+    if args.minpct:
+        sz = round(free_mb - (args.minpct * total_mb / 100))
+
+    elif args.minfree:
+        sz = free_mb - args.minfree
+
+    if sz < 0:
+        raise ValueError('Balloon size must be less than amount of free space')
+
+    balloon.mkballoon(sz)
+    balloon.inflate()
+    free_mb, total_mb = balloon.dgstats()
+    logging.info(f'Size: {total_mb} MiB')
+    logging.info(f'Free: {free_mb} MiB')
+
+    if not args.keep:
+        balloon.deflate()
+
+def cleanup(args):
+    balloon = Balloon(args.diskgroup)
+    balloon.deflate()
+
+def main():
+    parser = argparse.ArgumentParser(formatter_class = lambda prog: argparse.HelpFormatter(prog, max_help_position=40))
+    parser.add_argument('-D', '--debug', action="store_true", help='Show debug output')
+    subparsers = parser.add_subparsers(title='commands', dest='cmd')
+
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("diskgroup",  type=str, help="Diskgroup Name")
+
+    parser_reclaim  = subparsers.add_parser('reclaim',  parents=[parent], help='Reclaim space')
+    parser_cleanup  = subparsers.add_parser('cleanup',  parents=[parent], help='Cleanup balloon files')
+    parser_progress = subparsers.add_parser('progress', help='Show progress')
+
+    group = parser_reclaim.add_mutually_exclusive_group()
+    group.add_argument("--minfree",  type=int, metavar='mb',  help="Minimum MB free size, default 100", default=100)
+    group.add_argument("--size",     type=int, metavar='mb',  help="Size of balloon file")
+    group.add_argument("--minpct",   type=int, metavar='pct', help="Minimum %% free size")
+    parser_reclaim.add_argument("--keep",     action="store_true", help="Keep balloon file")
+
+    parser_reclaim.set_defaults(func=reclaim)
+    parser_cleanup.set_defaults(func=cleanup)
+    parser_progress.set_defaults(func=progress)
+
+    args   = parser.parse_args()
+
+    if args.debug:
+        logger = logging.getLogger()
+        logger.setLevel(logging.DEBUG)
+
+    try:
+        if args.cmd is None:
+            raise ValueError('Specify a command')
+        args.func(args)
+
+    except ValueError as e:
+        logging.error(e)
+
+    except Exception as e:
+        logging.exception(e)
+
+if __name__ == '__main__':
+    main()
